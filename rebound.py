@@ -80,6 +80,7 @@ def _eval_formula(b, s, g, formula):
 #   ② 17500备份：官方级全量TXT(2002至今)，补漏 + 交叉验证（灰鸟 limit=1 会跳过中间期）
 # ============================================================
 HUINIAO_URL = 'https://api.huiniao.top/interface/home/lotteryHistory?type=fcsd&page=1&limit=1'
+HUINIAO_URL20 = 'https://api.huiniao.top/interface/home/lotteryHistory?type=fcsd&page=1&limit=20'
 TXT17500_URL = 'https://www.17500.cn/getData/3d.TXT'
 
 # 换UA队列（17500 反爬 429 → 重试3次 + 换UA）
@@ -105,6 +106,22 @@ def _fetch_url(url, retries=3, timeout=15):
                 time.sleep(2)
     raise last_err
 
+def _valid_issue(issue):
+    """校验期号格式：20开头 + 7位数字（如 2026220）"""
+    return isinstance(issue, str) and re.match(r'^20\d{5}$', issue) is not None
+
+def _valid_digits(b, s, g):
+    """校验百十个都是 0-9 的整数"""
+    return all(isinstance(x, int) and 0 <= x <= 9 for x in [b, s, g])
+
+def next_issue_of(issue):
+    """本地兜底计算下一期期号，跨年回绕（福彩3D 年度最大约 356-358 期）"""
+    year = int(issue[:4])
+    seq = int(issue[4:])
+    if seq >= 356:
+        return f"{year + 1}001"
+    return f"{year}{seq + 1:03d}"
+
 def load_rows():
     rows = {}
     try:
@@ -120,7 +137,7 @@ def load_rows():
     return rows
 
 def fetch_and_merge():
-    """灰鸟主源(limit=1) + 17500全量补漏 + 交叉验证
+    """灰鸟主源(limit=1) + 17500全量补漏 + 灰鸟limit=20次选补漏 + 交叉验证
     返回 (new_draws 按期号升序, next_code)
     """
     local_rows = load_rows()
@@ -136,43 +153,85 @@ def fetch_and_merge():
         raw = _fetch_url(HUINIAO_URL, retries=2)
         items = json.loads(raw)['data']['data']['list']
         for it in items:
-            issue = it['code']
-            b, s, g = int(it['one']), int(it['two']), int(it['three'])
+            issue = it.get('code')
+            if not _valid_issue(issue):
+                continue
+            try:
+                b, s, g = int(it['one']), int(it['two']), int(it['three'])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if not _valid_digits(b, s, g):
+                continue
             if local_last and int(issue) <= int(local_last):
                 print(f"  [灰鸟] 期号{issue}<=本地, 跳过(旧数据)")
                 continue
             merged[issue] = (b, s, g)
-            if it.get('next_code'):
-                next_code = it['next_code']
-            print(f"  [灰鸟] 最新 {issue} = {b}{s}{g}")
+            nc = it.get('next_code')
+            if _valid_issue(nc):
+                next_code = nc
+            print(f"  [灰鸟] 最新 {issue} = {b}{s}{g} next={next_code}")
     except Exception as e:
         print(f"  [灰鸟] 失败 {str(e)[:60]}")
 
     # ② 17500 全量补漏（重试3次+换UA，补所有漏掉的中间期）
+    p17500_ok = False
     try:
         raw = _fetch_url(TXT17500_URL, retries=3)
         cnt = 0
         for l in raw.strip().split('\n'):
             parts = l.split()
-            if len(parts) >= 5 and re.match(r'^20\d{5}$', parts[0]):
+            if len(parts) >= 5 and _valid_issue(parts[0]):
                 issue = parts[0]
                 if local_last and int(issue) <= int(local_last):
                     continue
-                b, s, g = int(parts[2]), int(parts[3]), int(parts[4])
-                # 交叉验证：若灰鸟已给同期号，号码须一致，不一致以灰鸟为准并告警
+                try:
+                    b, s, g = int(parts[2]), int(parts[3]), int(parts[4])
+                except ValueError:
+                    continue
+                if not _valid_digits(b, s, g):
+                    continue
                 if issue in merged and merged[issue] != (b, s, g):
                     print(f"  ⚠ 交叉验证不一致 {issue}: 灰鸟{merged[issue]} vs 17500{(b,s,g)}, 以灰鸟为准")
                     continue
                 merged[issue] = (b, s, g)
                 cnt += 1
+        p17500_ok = True
         print(f"  [17500] 补漏{cnt}期")
     except Exception as e:
         print(f"  [17500] 失败 {str(e)[:60]}")
+
+    # ③ 灰鸟 limit=20 次选补漏（17500 失败时，灰鸟自身补中间漏期）
+    if not p17500_ok:
+        try:
+            raw = _fetch_url(HUINIAO_URL20, retries=2)
+            items = json.loads(raw)['data']['data']['list']
+            cnt = 0
+            for it in items:
+                issue = it.get('code')
+                if not _valid_issue(issue):
+                    continue
+                if local_last and int(issue) <= int(local_last):
+                    continue
+                try:
+                    b, s, g = int(it['one']), int(it['two']), int(it['three'])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if not _valid_digits(b, s, g):
+                    continue
+                if issue in merged and merged[issue] != (b, s, g):
+                    continue
+                merged[issue] = (b, s, g)
+                cnt += 1
+            print(f"  [灰鸟limit=20] 补漏{cnt}期")
+        except Exception as e:
+            print(f"  [灰鸟limit=20] 失败 {str(e)[:60]}")
 
     new_draws = [(iss, merged[iss][0], merged[iss][1], merged[iss][2])
                  for iss in sorted(merged.keys(), key=int)]
     if new_draws:
         print(f"  合计新增 {len(new_draws)} 期: {new_draws[0][0]} ~ {new_draws[-1][0]}")
+    else:
+        print(f"  无新数据（数据源均无更新或全部失败）")
     return new_draws, next_code
 
 def append_to_csv(draws):
@@ -210,6 +269,8 @@ def compute():
             issues.append(r['issue'])
             rows_list.append((int(r['hundreds']), int(r['tens']), int(r['ones'])))
     N = len(rows_list)
+    if N < 3:
+        return None  # 数据不足（至少需要3期才能计算错2期信号）
 
     # 逐期杀码命中序列 hit[pos][fi][t]
     hits = {}
@@ -225,7 +286,7 @@ def compute():
             hits[pos].append(h)
 
     # 当前预测（错2期公式）
-    pred_issue = str(int(issues[-1]) + 1)
+    pred_issue = next_issue_of(issues[-1])
     lb, ls, lg = rows_list[-1]
     prediction = {}
     for pos in POS_IDX:
@@ -289,6 +350,8 @@ def compute():
 # ============================================================
 def build_html(r):
     now = datetime.now(BJT).strftime('%Y-%m-%d %H:%M')
+    stale_html = ('<div class="stale">⚠ 本次运行数据源暂无新数据，页面可能滞后于最新开奖，请稍后刷新。</div>'
+                  if r.get('stale') else '')
 
     # 预测杀码卡片
     cards = []
@@ -372,6 +435,7 @@ th {{ background:#fafbfc; color:#8a929c; font-weight:600; text-align:center; pos
 .no {{ color:#e74c3c; }}
 .note {{ background:#fff; border-radius:14px; box-shadow:0 1px 8px rgba(0,0,0,.06); padding:14px 16px; margin-top:4px; font-size:.8rem; line-height:1.8; color:#3a4149; }}
 .note b {{ color:#e74c3c; }}
+.stale {{ background:#fff7e6; border:1px solid #ffd591; color:#ad6800; border-radius:12px; padding:10px 14px; margin-bottom:12px; font-size:.78rem; line-height:1.6; }}
 .foot {{ text-align:center; color:#b6bdc5; font-size:.68rem; margin-top:12px; }}
 </style>
 </head>
@@ -388,6 +452,8 @@ th {{ background:#fafbfc; color:#8a929c; font-weight:600; text-align:center; pos
 
 <div class="evidence"><b>错2期信号：</b>连错两期后必反弹。全史反弹率 <b>{rate_all:.1f}%</b>（{r['total_hit']}/{r['total_sig']}），是最强信号。</div>
 
+{stale_html}
+
 <div class="grid">{''.join(cards)}</div>
 
 <div class="panel">
@@ -397,7 +463,7 @@ th {{ background:#fafbfc; color:#8a929c; font-weight:600; text-align:center; pos
 </div>
 
 <div class="note"><b>用法说明：</b>① 🔴错2期 = 某公式连续两期杀错，下一期反弹（全史命中率 {rate_all:.1f}%）；② 彩色方块 = 该公式预测下一期「不会出」的杀码；③ 明细红色公式 = 错2期信号、绿✓=命中、红✗=杀错；④ 统计倾向 ≠ 保证，理性参考。</div>
-<div class="foot">数据源：fc3d-history.csv（{r['last_issue']} 期）· 云端全自动更新</div>
+<div class="foot">数据源：fc3d-history.csv（{r['last_issue']} 期）· 云端全自动更新 · 更新于 {now}</div>
 </div>
 </body>
 </html>'''
@@ -425,8 +491,12 @@ def main():
     # 3. 生成HTML
     print(f"\n[3/3] 生成HTML...")
     r = compute()
-    if next_code:
+    if r is None:
+        print("  数据不足（<3期），跳过生成")
+        sys.exit(0)
+    if next_code and _valid_issue(next_code):
         r['pred_issue'] = next_code
+    r['stale'] = (len(new_draws) == 0)  # 本次无新数据 → 页面标注可能滞后
     html = build_html(r)
     os.makedirs(os.path.dirname(HTML_OUT), exist_ok=True)
     with open(HTML_OUT, 'w', encoding='utf-8') as f:
