@@ -6,7 +6,7 @@
 部署：GitHub Actions 定时运行（北京22:00/23:30/01:00 三重备份）+ GitHub Pages
 仅用 Python 标准库，无第三方依赖。
 """
-import csv, json, os, sys, ssl, re
+import csv, json, os, sys, ssl, re, time
 from datetime import datetime, timezone, timedelta
 from urllib.request import urlopen, Request
 
@@ -75,29 +75,35 @@ def _eval_formula(b, s, g, formula):
     return total % 10
 
 # ============================================================
-# 数据抓取：多源降级（huiniao主源 / 17500全量 / apihz / zhcw）
+# 数据源（2026-08-19 老板确认）
+#   ① 灰鸟主源：limit=1 只取最新一期，自带 next_code（跨年期号回绕 12-31→次年001）
+#   ② 17500备份：官方级全量TXT(2002至今)，补漏 + 交叉验证（灰鸟 limit=1 会跳过中间期）
 # ============================================================
-def _parse_apihz(data):
-    if data.get('code') != 200:
-        return []
-    nums = str(data.get('number', '')).split('|')
-    if len(nums) != 3:
-        return []
-    try:
-        return [(data['qihao'], int(nums[0]), int(nums[1]), int(nums[2]), None)]
-    except (KeyError, ValueError):
-        return []
+HUINIAO_URL = 'https://api.huiniao.top/interface/home/lotteryHistory?type=fcsd&page=1&limit=1'
+TXT17500_URL = 'https://www.17500.cn/getData/3d.TXT'
 
-DATA_SOURCES = [
-    {'name': 'huiniao', 'type': 'json',
-     'url': 'https://api.huiniao.top/interface/home/lotteryHistory?type=fcsd&page=1&limit=5',
-     'parser': lambda data: [(it['code'], int(it['one']), int(it['two']), int(it['three']), it.get('next_code'))
-                             for it in data['data']['data']['list']]},
-    {'name': '17500', 'type': 'txt17500', 'url': 'https://www.17500.cn/getData/3d.TXT', 'parser': None},
-    {'name': 'apihz', 'type': 'json', 'url': 'https://cn.apihz.cn/api/caipiao/fucai3d.php?id=88888888&key=88888888',
-     'parser': _parse_apihz},
-    {'name': 'zhcw', 'type': 'html', 'url': 'https://www.zhcw.com/kjxx/fc3d/', 'parser': None},
+# 换UA队列（17500 反爬 429 → 重试3次 + 换UA）
+UA_LIST = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Python-urllib/3.11',
 ]
+
+def _fetch_url(url, retries=3, timeout=15):
+    """带重试 + 换UA 的抓取（防 17500 反爬 429）"""
+    last_err = None
+    for i in range(retries):
+        ua = UA_LIST[i % len(UA_LIST)]
+        try:
+            req = Request(url, headers={'User-Agent': ua})
+            ctx = ssl._create_unverified_context()
+            with urlopen(req, timeout=timeout, context=ctx) as resp:
+                return resp.read().decode('utf-8', errors='ignore')
+        except Exception as e:
+            last_err = e
+            if i < retries - 1:
+                time.sleep(2)
+    raise last_err
 
 def load_rows():
     rows = {}
@@ -113,45 +119,61 @@ def load_rows():
         pass
     return rows
 
-def fetch_latest():
+def fetch_and_merge():
+    """灰鸟主源(limit=1) + 17500全量补漏 + 交叉验证
+    返回 (new_draws 按期号升序, next_code)
+    """
     local_rows = load_rows()
     local_last = max(local_rows.keys(), key=int) if local_rows else None
     if local_last:
         print(f"  本地最新期号: {local_last}")
-    for src in DATA_SOURCES:
-        try:
-            req = Request(src['url'], headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-            ctx = ssl._create_unverified_context()
-            with urlopen(req, timeout=12, context=ctx) as resp:
-                raw = resp.read().decode('utf-8', errors='ignore')
-            if src['type'] == 'json' and src['parser']:
-                draws = src['parser'](json.loads(raw))
-            elif src['type'] == 'txt17500':
-                draws = []
-                lines = [l for l in raw.strip().split('\n') if l.strip()]
-                for l in lines[-5:]:
-                    parts = l.split()
-                    if len(parts) >= 5 and re.match(r'^20\d{5}$', parts[0]):
-                        draws.append((parts[0], int(parts[2]), int(parts[3]), int(parts[4]), None))
-            elif src['type'] == 'html':
-                draws = []
-                for issue, b, s, g in re.findall(r'(20\d{5})\D*?(\d)\D+?(\d)\D+?(\d)', raw):
-                    if 2024 <= int(issue[:4]) <= 2030:
-                        draws.append((issue, int(b), int(s), int(g), None))
-            else:
-                draws = []
-            if not draws:
-                print(f"  [{src['name']}] 无数据")
+
+    merged = {}     # issue -> (b, s, g)
+    next_code = None
+
+    # ① 灰鸟主源 limit=1（拿最新一期 + next_code）
+    try:
+        raw = _fetch_url(HUINIAO_URL, retries=2)
+        items = json.loads(raw)['data']['data']['list']
+        for it in items:
+            issue = it['code']
+            b, s, g = int(it['one']), int(it['two']), int(it['three'])
+            if local_last and int(issue) <= int(local_last):
+                print(f"  [灰鸟] 期号{issue}<=本地, 跳过(旧数据)")
                 continue
-            src_latest = max(int(d[0]) for d in draws)
-            if local_last and src_latest <= int(local_last):
-                print(f"  [{src['name']}] 期号{src_latest}<=本地{local_last}, 跳过(旧数据)")
-                continue
-            print(f"  [{src['name']}] 获取{len(draws)}条, 最新{src_latest}")
-            return src['name'], draws
-        except Exception as e:
-            print(f"  [{src['name']}] 失败 {str(e)[:60]}")
-    return None, []
+            merged[issue] = (b, s, g)
+            if it.get('next_code'):
+                next_code = it['next_code']
+            print(f"  [灰鸟] 最新 {issue} = {b}{s}{g}")
+    except Exception as e:
+        print(f"  [灰鸟] 失败 {str(e)[:60]}")
+
+    # ② 17500 全量补漏（重试3次+换UA，补所有漏掉的中间期）
+    try:
+        raw = _fetch_url(TXT17500_URL, retries=3)
+        cnt = 0
+        for l in raw.strip().split('\n'):
+            parts = l.split()
+            if len(parts) >= 5 and re.match(r'^20\d{5}$', parts[0]):
+                issue = parts[0]
+                if local_last and int(issue) <= int(local_last):
+                    continue
+                b, s, g = int(parts[2]), int(parts[3]), int(parts[4])
+                # 交叉验证：若灰鸟已给同期号，号码须一致，不一致以灰鸟为准并告警
+                if issue in merged and merged[issue] != (b, s, g):
+                    print(f"  ⚠ 交叉验证不一致 {issue}: 灰鸟{merged[issue]} vs 17500{(b,s,g)}, 以灰鸟为准")
+                    continue
+                merged[issue] = (b, s, g)
+                cnt += 1
+        print(f"  [17500] 补漏{cnt}期")
+    except Exception as e:
+        print(f"  [17500] 失败 {str(e)[:60]}")
+
+    new_draws = [(iss, merged[iss][0], merged[iss][1], merged[iss][2])
+                 for iss in sorted(merged.keys(), key=int)]
+    if new_draws:
+        print(f"  合计新增 {len(new_draws)} 期: {new_draws[0][0]} ~ {new_draws[-1][0]}")
+    return new_draws, next_code
 
 def append_to_csv(draws):
     rows = load_rows()
@@ -388,20 +410,14 @@ def main():
     print(f"=== 福彩3D 错后反弹 自动更新 ===")
     print(f"  时间(北京): {datetime.now(BJT).strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # 1. 多源抓取
-    print(f"\n[1/3] 多源降级抓取...")
-    src_name, draws = fetch_latest()
-
-    next_code = None
-    if draws:
-        latest_draw = max(draws, key=lambda d: int(d[0]))
-        if len(latest_draw) > 4 and latest_draw[4]:
-            next_code = latest_draw[4]
+    # 1. 抓取（灰鸟主源 limit=1 + 17500 全量补漏 + 交叉验证）
+    print(f"\n[1/3] 抓取(灰鸟主源+17500补漏)...")
+    new_draws, next_code = fetch_and_merge()
 
     # 2. 追加CSV
     print(f"\n[2/3] 更新CSV...")
-    if draws:
-        added = append_to_csv(draws)
+    if new_draws:
+        added = append_to_csv(new_draws)
         print(f"  新增{added}期")
     else:
         print(f"  无新数据，跳过CSV更新")

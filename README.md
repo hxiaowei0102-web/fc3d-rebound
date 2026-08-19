@@ -9,7 +9,9 @@
 
 ## 云端自动更新
 - GitHub Actions cron 三重备份：UTC 14:00 / 15:30 / 17:00（北京 22:00 / 23:30 / 01:00）
-- 多数据源降级：huiniao(主) / 17500(全量) / apihz / zhcw，每源带期号校验防缓存
+- 数据源双活：
+  - **灰鸟主源**（`api.huiniao.top`，limit=1）：自带 next_code 跨年期号回绕
+  - **17500 备份源**（`17500.cn/getData/3d.TXT`，官方全量）：重试3次+换UA防429，补漏 + 交叉验证
 - 每日抓取最新开奖 → 追加 `data/fc3d-history.csv`（不覆盖）→ 生成 `static/index.html` → 部署 GitHub Pages
 
 ## 文件
